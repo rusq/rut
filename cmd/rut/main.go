@@ -11,6 +11,7 @@ import (
 	"runtime/trace"
 	"strings"
 
+	"github.com/rusq/rut/cmd/rut/internal/authloginfo"
 	"github.com/rusq/rut/cmd/rut/internal/bench"
 	"github.com/rusq/rut/cmd/rut/internal/cfg"
 	"github.com/rusq/rut/cmd/rut/internal/golang/base"
@@ -19,16 +20,12 @@ import (
 
 func init() {
 	base.CmdRUT.Commands = []*base.Command{
-		// Add commands here.
+		authloginfo.CmdAuthLogInfo,
 		bench.CmdBench,
 	}
 }
 
 func main() {
-	if isRoot() {
-		log.Fatal("rut:  cowardly refusing to run as root")
-	}
-
 	flag.Usage = base.Usage
 	flag.Parse()
 
@@ -215,8 +212,4 @@ func iftrue[T any](cond bool, t T, f T) T {
 		return t
 	}
 	return f
-}
-
-func isRoot() bool {
-	return os.Geteuid() == 0
 }
