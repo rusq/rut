@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rusq/rut/cmd/rut/internal/cfg"
@@ -35,11 +36,12 @@ var CmdBench = &base.Command{
 	Run: runBench, UsageLine: "rut bench [flags]", Short: "runs CPU, memory, and disk benchmarks",
 	FlagMask: cfg.OmitSomeFlag, PrintFlags: true,
 	Long: `
-Bench runs CPU counting, memory-copy, synced sequential-disk-write, and
-buffered sequential-disk-read benchmarks. Use -run to select benchmark names.
-Disk reads may be served by the operating system page cache. Disk benchmarks
-use a uniquely named temporary file in -disk-dir and remove it when finished,
-including after errors or cancellation.
+Bench runs single-core and multicore CPU counting, memory-copy, synced
+sequential-disk-write, and buffered sequential-disk-read benchmarks. The
+multicore benchmark uses GOMAXPROCS workers. Use -run to select benchmark
+names. Disk reads may be served by the operating system page cache. Disk
+benchmarks use a uniquely named temporary file in -disk-dir and remove it when
+finished, including after errors or cancellation.
 
 Examples:
   rut bench
@@ -49,7 +51,7 @@ Examples:
 }
 
 func init() {
-	CmdBench.Flag.Int64Var(&countTo, "n", defaultCount, "count from zero to N in each CPU benchmark iteration")
+	CmdBench.Flag.Int64Var(&countTo, "n", defaultCount, "count from zero to N per worker in each CPU benchmark iteration")
 	CmdBench.Flag.BoolVar(&benchMem, "benchmem", false, "print memory allocation statistics for every selected benchmark")
 	CmdBench.Flag.StringVar(&runPattern, "run", ".", "run only benchmarks with names matching regexp")
 	CmdBench.Flag.Var(&benchSize, "size", "memory buffer and disk file size in bytes, KiB, MiB, or GiB")
@@ -136,13 +138,13 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 	if err != nil {
 		return regexpError{fmt.Errorf("invalid -run regexp: %w", err)}
 	}
-	names := []string{"CPUCount", "MemoryCopy", "DiskWrite", "DiskRead"}
+	names := []string{"CPUCount", "CPUMulticore", "MemoryCopy", "DiskWrite", "DiskRead"}
 	selected := make([]bool, len(names))
 	any, disk := false, false
 	for i, name := range names {
 		selected[i] = re.MatchString(name)
 		any = any || selected[i]
-		disk = disk || (i >= 2 && selected[i])
+		disk = disk || ((name == "DiskWrite" || name == "DiskRead") && selected[i])
 	}
 	if !any {
 		return regexpError{fmt.Errorf("-run %q matches no benchmarks", c.pattern)}
@@ -164,9 +166,13 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 			continue
 		}
 		var result testing.BenchmarkResult
+		workers := 0
 		switch name {
 		case "CPUCount":
 			result, err = benchCPU(ctx, c.count, c.benchMem)
+		case "CPUMulticore":
+			workers = runtime.GOMAXPROCS(0)
+			result, err = benchCPUMulticore(ctx, c.count, workers, c.benchMem)
 		case "MemoryCopy":
 			result, err = benchMemory(ctx, c.size, c.benchMem)
 		case "DiskWrite":
@@ -180,6 +186,8 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 		label := fmt.Sprintf("Benchmark%s-%s", name, formatSize(c.size))
 		if name == "CPUCount" {
 			label = fmt.Sprintf("BenchmarkCPUCount-%d", c.count)
+		} else if name == "CPUMulticore" {
+			label = fmt.Sprintf("BenchmarkCPUMulticore-%d-%dworkers", c.count, workers)
 		}
 		fmt.Fprintf(w, "%s\t%s", label, result)
 		if c.benchMem {
@@ -219,6 +227,7 @@ func cpuName() string {
 }
 
 var cpuCountResult int64
+var cpuMulticoreResults []int64
 
 func benchCPU(ctx context.Context, n int64, allocs bool) (testing.BenchmarkResult, error) {
 	var canceled bool
@@ -236,6 +245,55 @@ func benchCPU(ctx context.Context, n int64, allocs bool) (testing.BenchmarkResul
 			}
 		}
 		cpuCountResult = count
+	})
+	if canceled {
+		return r, ctx.Err()
+	}
+	return r, nil
+}
+
+func benchCPUMulticore(ctx context.Context, n int64, workers int, allocs bool) (testing.BenchmarkResult, error) {
+	if workers <= 0 {
+		return testing.BenchmarkResult{}, fmt.Errorf("multicore benchmark requires at least one worker")
+	}
+
+	var canceled bool
+	r := testing.Benchmark(func(b *testing.B) {
+		if allocs {
+			b.ReportAllocs()
+		}
+
+		results := make([]int64, workers)
+		cancellations := make([]bool, workers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for worker := 0; worker < workers; worker++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				var count int64
+				for i := 0; i < b.N; i++ {
+					if ctx.Err() != nil {
+						cancellations[worker] = true
+						return
+					}
+					for count = 0; count < n; count++ {
+					}
+				}
+				results[worker] = count
+			}()
+		}
+
+		b.ResetTimer()
+		close(start)
+		wg.Wait()
+		b.StopTimer()
+
+		for _, wasCanceled := range cancellations {
+			canceled = canceled || wasCanceled
+		}
+		cpuMulticoreResults = append(cpuMulticoreResults[:0], results...)
 	})
 	if canceled {
 		return r, ctx.Err()

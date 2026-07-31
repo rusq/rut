@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -49,7 +50,26 @@ func TestRunSuiteSelectedOutput(t *testing.T) {
 	if strings.Count(got, "goos: ") != 1 || !strings.Contains(got, "BenchmarkCPUCount-0") {
 		t.Fatalf("unexpected output:\n%s", got)
 	}
-	for _, unwanted := range []string{"BenchmarkMemoryCopy", "BenchmarkDiskWrite", "BenchmarkDiskRead"} {
+	for _, unwanted := range []string{"BenchmarkCPUMulticore", "BenchmarkMemoryCopy", "BenchmarkDiskWrite", "BenchmarkDiskRead"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+func TestRunSuiteSelectsCPUMulticore(t *testing.T) {
+	var output bytes.Buffer
+	workers := runtime.GOMAXPROCS(0)
+	err := runSuite(context.Background(), &output, suiteConfig{count: 0, size: 1, pattern: "^CPUMulticore$", diskDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	want := "BenchmarkCPUMulticore-0-" + strconv.Itoa(workers) + "workers"
+	if !strings.Contains(got, want) {
+		t.Fatalf("output does not contain %q:\n%s", want, got)
+	}
+	for _, unwanted := range []string{"BenchmarkCPUCount", "BenchmarkMemoryCopy", "BenchmarkDiskWrite", "BenchmarkDiskRead"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("output unexpectedly contains %q", unwanted)
 		}
@@ -114,6 +134,29 @@ func TestBenchCPUCountsToN(t *testing.T) {
 	}
 }
 
+func TestBenchCPUMulticoreCountsToNPerWorker(t *testing.T) {
+	const (
+		n       = 10
+		workers = 2
+	)
+
+	result, err := benchCPUMulticore(context.Background(), n, workers, false)
+	if err != nil {
+		t.Fatalf("benchCPUMulticore() error = %v", err)
+	}
+	if result.N <= 0 {
+		t.Fatalf("benchCPUMulticore() iterations = %d, want positive", result.N)
+	}
+	if len(cpuMulticoreResults) != workers {
+		t.Fatalf("benchCPUMulticore() results = %v, want %d workers", cpuMulticoreResults, workers)
+	}
+	for worker, count := range cpuMulticoreResults {
+		if count != n {
+			t.Errorf("benchCPUMulticore() worker %d count = %d, want %d", worker, count, n)
+		}
+	}
+}
+
 func TestPrintBenchmarkPreamble(t *testing.T) {
 	var output bytes.Buffer
 	printBenchmarkPreamble(&output)
@@ -136,5 +179,14 @@ func TestBenchCPUWithCanceledContext(t *testing.T) {
 
 	if _, err := benchCPU(ctx, 10, false); err != context.Canceled {
 		t.Fatalf("benchCPU() error = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestBenchCPUMulticoreWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := benchCPUMulticore(ctx, 10, 2, false); err != context.Canceled {
+		t.Fatalf("benchCPUMulticore() error = %v, want %v", err, context.Canceled)
 	}
 }
