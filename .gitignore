@@ -1,1 +1,5 @@
-rut
+/rut
+/rut.exe
+*~
+.*~
+.DS_Store

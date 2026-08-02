@@ -32,6 +32,39 @@ func TestParseSize(t *testing.T) {
 	}
 }
 
+func TestResolveDiskSizeWithAvailable(t *testing.T) {
+	const MiB = int64(1 << 20)
+	tests := []struct {
+		name      string
+		requested int64
+		explicit  bool
+		available uint64
+		want      int64
+		adjusted  bool
+		wantErr   bool
+	}{
+		{"fits by default", 64 * MiB, false, uint64(256 * MiB), 64 * MiB, false, false},
+		{"halves constrained space", 64 * MiB, false, uint64(60*MiB + 512), 30 * MiB, true, false},
+		{"explicit size is preserved", 32 * MiB, true, uint64(64 * MiB), 32 * MiB, false, false},
+		{"explicit size fails when unavailable", 64 * MiB, true, uint64(32 * MiB), 0, false, true},
+		{"too little space", 64 * MiB, false, uint64(2*MiB - 1), 0, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, adjusted, err := resolveDiskSizeWithAvailable(tt.requested, tt.explicit, tt.available)
+			if (err != nil) != tt.wantErr || got != tt.want || adjusted != tt.adjusted {
+				t.Fatalf("resolveDiskSizeWithAvailable() = %d, %t, %v; want %d, %t, error=%t", got, adjusted, err, tt.want, tt.adjusted, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestFormatAvailableSaturates(t *testing.T) {
+	if got := formatAvailable(^uint64(0)); got != "9223372036854775807" {
+		t.Fatalf("formatAvailable(max) = %q", got)
+	}
+}
+
 func TestRunSuiteRejectsBadSelectors(t *testing.T) {
 	for _, pattern := range []string{"[", "DoesNotExist"} {
 		err := runSuite(context.Background(), &bytes.Buffer{}, suiteConfig{count: 1, size: 1, pattern: pattern, diskDir: t.TempDir()})

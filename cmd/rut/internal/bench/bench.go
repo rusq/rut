@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -105,6 +106,7 @@ func formatSize(n int64) string {
 type suiteConfig struct {
 	count, size      int64
 	benchMem         bool
+	sizeExplicit     bool
 	pattern, diskDir string
 }
 
@@ -118,7 +120,13 @@ func runBench(ctx context.Context, cmd *base.Command, args []string) error {
 	if int64(benchSize) <= 0 {
 		return invalid(fmt.Errorf("-size must be positive"))
 	}
-	err := runSuite(ctx, os.Stdout, suiteConfig{countTo, int64(benchSize), benchMem, runPattern, diskDir})
+	sizeExplicit := false
+	cmd.Flag.Visit(func(f *flag.Flag) {
+		if f.Name == "size" {
+			sizeExplicit = true
+		}
+	})
+	err := runSuite(ctx, os.Stdout, suiteConfig{countTo, int64(benchSize), benchMem, sizeExplicit, runPattern, diskDir})
 	if err != nil {
 		if _, ok := err.(regexpError); ok {
 			return invalid(err)
@@ -161,7 +169,18 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 		defer os.Remove(name)
 		defer f.Close()
 	}
+	diskSize := c.size
+	var diskNotice string
+	if disk {
+		diskSize, diskNotice, err = resolveDiskSize(f.Name(), c.size, c.sizeExplicit)
+		if err != nil {
+			return err
+		}
+	}
 	printBenchmarkPreamble(w)
+	if diskNotice != "" {
+		fmt.Fprintln(w, diskNotice)
+	}
 	for i, name := range names {
 		if !selected[i] {
 			continue
@@ -177,14 +196,18 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 		case "MemoryCopy":
 			result, err = benchMemory(ctx, c.size, c.benchMem)
 		case "DiskWrite":
-			result, err = benchDiskWrite(ctx, f, c.size, c.benchMem)
+			result, err = benchDiskWrite(ctx, f, diskSize, c.benchMem)
 		case "DiskRead":
-			result, err = benchDiskRead(ctx, f, c.size, c.benchMem)
+			result, err = benchDiskRead(ctx, f, diskSize, c.benchMem)
 		}
 		if err != nil {
 			return err
 		}
-		label := fmt.Sprintf("Benchmark%s-%s", name, formatSize(c.size))
+		resultSize := c.size
+		if name == "DiskWrite" || name == "DiskRead" {
+			resultSize = diskSize
+		}
+		label := fmt.Sprintf("Benchmark%s-%s", name, formatSize(resultSize))
 		switch name {
 		case "CPUCount":
 			result.Extra = withCPUParrots(result.Extra, result, c.count, 1)
