@@ -41,7 +41,8 @@ sequential-disk-write, and buffered sequential-disk-read benchmarks. The
 multicore benchmark uses GOMAXPROCS workers. Use -run to select benchmark
 names. Disk reads may be served by the operating system page cache. Disk
 benchmarks use a uniquely named temporary file in -disk-dir and remove it when
-finished, including after errors or cancellation.
+finished, including after errors or cancellation. CPU results include parrots,
+where one parrot is one million completed counter increments per second.
 
 Examples:
   rut bench
@@ -77,8 +78,8 @@ func parseSize(v string) (int64, error) {
 		name string
 		mult int64
 	}{{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}} {
-		if strings.HasSuffix(v, suffix.name) {
-			num, mult = strings.TrimSuffix(v, suffix.name), suffix.mult
+		if before, ok := strings.CutSuffix(v, suffix.name); ok {
+			num, mult = before, suffix.mult
 			break
 		}
 	}
@@ -184,9 +185,12 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 			return err
 		}
 		label := fmt.Sprintf("Benchmark%s-%s", name, formatSize(c.size))
-		if name == "CPUCount" {
+		switch name {
+		case "CPUCount":
+			result.Extra = withCPUParrots(result.Extra, result, c.count, 1)
 			label = fmt.Sprintf("BenchmarkCPUCount-%d", c.count)
-		} else if name == "CPUMulticore" {
+		case "CPUMulticore":
+			result.Extra = withCPUParrots(result.Extra, result, c.count, workers)
 			label = fmt.Sprintf("BenchmarkCPUMulticore-%d-%dworkers", c.count, workers)
 		}
 		fmt.Fprintf(w, "%s\t%s", label, result)
@@ -196,6 +200,18 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 		fmt.Fprintln(w)
 	}
 	return nil
+}
+
+func withCPUParrots(extra map[string]float64, result testing.BenchmarkResult, count int64, workers int) map[string]float64 {
+	if extra == nil {
+		extra = make(map[string]float64)
+	}
+	if result.N <= 0 || result.T <= 0 || count <= 0 || workers <= 0 {
+		extra["parrots"] = 0
+		return extra
+	}
+	extra["parrots"] = float64(result.N) * float64(count) * float64(workers) / result.T.Seconds() / 1_000_000
+	return extra
 }
 
 func printBenchmarkPreamble(w io.Writer) {
@@ -212,7 +228,7 @@ func cpuName() string {
 	}
 	if runtime.GOOS == "linux" {
 		if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
+			for line := range strings.SplitSeq(string(data), "\n") {
 				key, value, ok := strings.Cut(line, ":")
 				if ok && (strings.TrimSpace(key) == "model name" || strings.TrimSpace(key) == "Hardware") && strings.TrimSpace(value) != "" {
 					return strings.TrimSpace(value)
@@ -268,7 +284,7 @@ func benchCPUMulticore(ctx context.Context, n int64, workers int, allocs bool) (
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		wg.Add(workers)
-		for worker := 0; worker < workers; worker++ {
+		for worker := range workers {
 			go func() {
 				defer wg.Done()
 				<-start

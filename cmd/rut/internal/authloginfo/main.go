@@ -123,7 +123,7 @@ func renderCountTable(w io.Writer, title string, keyColumn string, counts map[st
 }
 
 func init() {
-	table.DefaultHeaderFormatter = func(format string, vals ...interface{}) string {
+	table.DefaultHeaderFormatter = func(format string, vals ...any) string {
 		return strings.ToUpper(fmt.Sprintf(format, vals...))
 	}
 }

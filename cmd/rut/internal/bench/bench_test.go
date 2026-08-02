@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSize(t *testing.T) {
@@ -72,6 +73,52 @@ func TestRunSuiteSelectsCPUMulticore(t *testing.T) {
 	for _, unwanted := range []string{"BenchmarkCPUCount", "BenchmarkMemoryCopy", "BenchmarkDiskWrite", "BenchmarkDiskRead"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("output unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+func TestCPUParrots(t *testing.T) {
+	tests := []struct {
+		name    string
+		result  testing.BenchmarkResult
+		count   int64
+		workers int
+		want    float64
+	}{
+		{"single core", testing.BenchmarkResult{N: 2, T: 4 * time.Second}, 1_000_000, 1, 0.5},
+		{"multicore", testing.BenchmarkResult{N: 2, T: 4 * time.Second}, 1_000_000, 8, 4},
+		{"zero count", testing.BenchmarkResult{N: 2, T: time.Second}, 0, 1, 0},
+		{"zero duration", testing.BenchmarkResult{N: 2}, 1_000_000, 1, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extra := withCPUParrots(map[string]float64{"existing": 1}, tt.result, tt.count, tt.workers)
+			if got := extra["parrots"]; got != tt.want {
+				t.Errorf("parrots = %v, want %v", got, tt.want)
+			}
+			if extra["existing"] != 1 {
+				t.Errorf("existing metric was not preserved: %v", extra)
+			}
+		})
+	}
+}
+
+func TestRunSuiteReportsParrotsForCPUOnly(t *testing.T) {
+	var output bytes.Buffer
+	err := runSuite(context.Background(), &output, suiteConfig{count: 0, size: 1, benchMem: true, pattern: "CPU|MemoryCopy", diskDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(output.String(), "\n") {
+		switch {
+		case strings.HasPrefix(line, "BenchmarkCPU"):
+			if !strings.Contains(line, "parrots") || !strings.Contains(line, "ns/op") || !strings.Contains(line, "B/op") {
+				t.Errorf("CPU result is missing metrics: %q", line)
+			}
+		case strings.HasPrefix(line, "BenchmarkMemoryCopy"):
+			if strings.Contains(line, "parrots") {
+				t.Errorf("memory result unexpectedly contains parrots: %q", line)
+			}
 		}
 	}
 }
