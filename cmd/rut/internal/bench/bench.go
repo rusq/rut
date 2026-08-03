@@ -142,18 +142,27 @@ type regexpError struct{ error }
 func (e regexpError) Error() string { return e.error.Error() }
 func invalid(err error) error       { base.SetExitStatus(base.SInvalidParameters); return err }
 
+// benchmark names
+const (
+	bCPUCount     = "CPUCount"
+	bCPUMulticore = "CPUMulticore"
+	bMemoryCopy   = "MemoryCopy"
+	bDiskWrite    = "DiskWrite"
+	bDiskRead     = "DiskRead"
+)
+
 func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 	re, err := regexp.Compile(c.pattern)
 	if err != nil {
 		return regexpError{fmt.Errorf("invalid -run regexp: %w", err)}
 	}
-	names := []string{"CPUCount", "CPUMulticore", "MemoryCopy", "DiskWrite", "DiskRead"}
+	names := []string{bCPUCount, bCPUMulticore, bMemoryCopy, bDiskWrite, bDiskRead}
 	selected := make([]bool, len(names))
 	any, disk := false, false
 	for i, name := range names {
 		selected[i] = re.MatchString(name)
 		any = any || selected[i]
-		disk = disk || ((name == "DiskWrite" || name == "DiskRead") && selected[i])
+		disk = disk || ((name == bDiskWrite || name == bDiskRead) && selected[i])
 	}
 	if !any {
 		return regexpError{fmt.Errorf("-run %q matches no benchmarks", c.pattern)}
@@ -181,6 +190,7 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 	if diskNotice != "" {
 		fmt.Fprintln(w, diskNotice)
 	}
+
 	for i, name := range names {
 		if !selected[i] {
 			continue
@@ -188,31 +198,31 @@ func runSuite(ctx context.Context, w io.Writer, c suiteConfig) error {
 		var result testing.BenchmarkResult
 		workers := 0
 		switch name {
-		case "CPUCount":
+		case bCPUCount:
 			result, err = benchCPU(ctx, c.count, c.benchMem)
-		case "CPUMulticore":
+		case bCPUMulticore:
 			workers = runtime.GOMAXPROCS(0)
 			result, err = benchCPUMulticore(ctx, c.count, workers, c.benchMem)
-		case "MemoryCopy":
+		case bMemoryCopy:
 			result, err = benchMemory(ctx, c.size, c.benchMem)
-		case "DiskWrite":
+		case bDiskWrite:
 			result, err = benchDiskWrite(ctx, f, diskSize, c.benchMem)
-		case "DiskRead":
+		case bDiskRead:
 			result, err = benchDiskRead(ctx, f, diskSize, c.benchMem)
 		}
 		if err != nil {
 			return err
 		}
 		resultSize := c.size
-		if name == "DiskWrite" || name == "DiskRead" {
+		if name == bDiskWrite || name == bDiskRead {
 			resultSize = diskSize
 		}
 		label := fmt.Sprintf("Benchmark%s-%s", name, formatSize(resultSize))
 		switch name {
-		case "CPUCount":
+		case bCPUCount:
 			result.Extra = withCPUParrots(result.Extra, result, c.count, 1)
 			label = fmt.Sprintf("BenchmarkCPUCount-%d", c.count)
-		case "CPUMulticore":
+		case bCPUMulticore:
 			result.Extra = withCPUParrots(result.Extra, result, c.count, workers)
 			label = fmt.Sprintf("BenchmarkCPUMulticore-%d-%dworkers", c.count, workers)
 		}
