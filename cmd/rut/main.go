@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime/trace"
 	"strings"
+	"time"
 
 	"github.com/rusq/rut/cmd/rut/internal/authloginfo"
 	"github.com/rusq/rut/cmd/rut/internal/bench"
@@ -110,21 +111,44 @@ func invoke(cmd *base.Command, args []string) error {
 	stop := initTrace(cfg.TraceFile)
 	base.AtExit(stop)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	ctx, task := trace.NewTask(ctx, "command")
-	defer task.End()
-
 	// initialise default logging.
 	if lg, err := initLog(cfg.LogFile, cfg.JsonHandler, cfg.Verbose); err != nil {
 		return err
 	} else {
 		cfg.Log = lg.With("command", cmd.Name())
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	commandDone := make(chan struct{})
+	defer func() {
+		signal.Stop(interrupts)
+		cancel()
+		close(commandDone)
+	}()
+	go superviseCancellation(interrupts, commandDone, cancel, cfg.Log, 5*time.Second)
+
+	ctx, task := trace.NewTask(ctx, "command")
+	defer task.End()
 
 	trace.Log(ctx, "command", fmt.Sprint("Running ", cmd.Name(), " command"))
 	return cmd.Run(ctx, cmd, args)
+}
+
+func superviseCancellation(interrupts <-chan os.Signal, commandDone <-chan struct{}, cancel context.CancelFunc, logger *slog.Logger, timeout time.Duration) {
+	select {
+	case <-interrupts:
+		logger.Info("termination started; cleanup has a five-second timeout")
+		cancel()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-commandDone:
+		case <-timer.C:
+			logger.Error("cleanup timed out after five seconds")
+		}
+	case <-commandDone:
+	}
 }
 
 func parseFlags(cmd *base.Command, args []string) ([]string, error) {

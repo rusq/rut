@@ -1,14 +1,70 @@
 package sdbench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rusq/rut/cmd/rut/internal/cfg"
 )
+
+func TestExecuteLogsBenchmarkPhasesAndProgress(t *testing.T) {
+	var logs bytes.Buffer
+	oldLog := cfg.Log
+	oldInterval := sequentialProgressInterval
+	cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	sequentialProgressInterval = 0
+	t.Cleanup(func() {
+		cfg.Log = oldLog
+		sequentialProgressInterval = oldInterval
+	})
+
+	if _, err := execute(context.Background(), t.TempDir(), "1MiB", time.Millisecond, 1, 2, 42); err != nil {
+		t.Fatal(err)
+	}
+	text := logs.String()
+	for _, want := range []string{
+		"sdbench started", "phase=sequential_write", "phase=sequential_read_verify",
+		"sdbench phase completed", "sdbench progress", "completed_bytes=", "percentage=",
+		"sdbench completed",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("log output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRunCleanup(t *testing.T) {
+	oldTimeout := cleanupTimeout
+	cleanupTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { cleanupTimeout = oldTimeout })
+
+	if err := runCleanup(func() error { return nil }); err != nil {
+		t.Fatalf("successful cleanup: %v", err)
+	}
+	want := errors.New("remove failed")
+	if err := runCleanup(func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("failing cleanup: %v, want %v", err, want)
+	}
+	release := make(chan struct{})
+	start := time.Now()
+	err := runCleanup(func() error { <-release; return nil })
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("blocking cleanup returned after %s", elapsed)
+	}
+	var timeout cleanupTimeoutError
+	if !errors.As(err, &timeout) || timeout.timeout != cleanupTimeout {
+		t.Fatalf("blocking cleanup error = %v, want timeout of %s", err, cleanupTimeout)
+	}
+	close(release)
+}
 
 func TestParseSizeSpecScalesSmallCard(t *testing.T) {
 	got, err := parseSizeSpec("auto", 32<<20)

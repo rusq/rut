@@ -30,6 +30,11 @@ const (
 )
 
 var (
+	cleanupTimeout             = 5 * time.Second
+	sequentialProgressInterval = 5 * time.Second
+)
+
+var (
 	sizeFlag            = "auto"
 	randomTime          = defaultRandomTime
 	syncOps             = defaultSyncOps
@@ -253,6 +258,7 @@ func execute(ctx context.Context, requested, sizeText string, randomDuration tim
 	}
 	r.Config = configReport{SizeBytes: sz.value, RandomDuration: randomDuration.String(), SyncOps: syncCount, MetadataFiles: fileCount, Seed: randomSeed}
 	r.CacheControl = cacheMethod()
+	cfg.Log.Info("sdbench started", "target", resolved, "size_bytes", sz.value)
 	if r.CacheControl == "uncontrolled" {
 		r.Warnings = append(r.Warnings, "the platform cannot request cache eviction; read results may include filesystem cache")
 	}
@@ -262,51 +268,105 @@ func execute(ctx context.Context, requested, sizeText string, randomDuration tim
 		return r, fmt.Errorf("create private workspace: %w", err)
 	}
 	defer func() {
-		if e := os.RemoveAll(workspace); e != nil {
+		if e := runCleanup(func() error { return os.RemoveAll(workspace) }); e != nil {
 			r.Warnings = append(r.Warnings, "could not remove temporary workspace: "+e.Error())
 			if err == nil {
-				err = e
+				err = fmt.Errorf("remove temporary workspace: %w", e)
+				r.Error = err.Error()
 				r.Status = "failed"
 			}
 		}
 	}()
 	dataPath := filepath.Join(workspace, "data.bin")
+	phaseCount := 0
+	logCompleted := func() { logCompletedPhases(&r, &phaseCount) }
+	cfg.Log.Info("sdbench phase started", "phase", "sequential_write")
 	if err = phaseSequential(ctx, dataPath, sz.value, randomSeed, &r); err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
+	logCompleted()
+	cfg.Log.Info("sdbench phase started", "phase", "random_read")
 	if err = phaseRandomRead(ctx, dataPath, sz.value, randomDuration, randomSeed, &r); err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
+	logCompleted()
 	writeSeed := randomSeed + 1
 	syncSeed := randomSeed + 2
+	cfg.Log.Info("sdbench phase started", "phase", "random_write")
 	writeState, err := phaseRandomWrite(ctx, dataPath, sz.value, randomDuration, writeSeed, &r)
 	if err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
+	logCompleted()
+	cfg.Log.Info("sdbench phase started", "phase", "sync_latency")
 	if err = phaseSync(ctx, dataPath, sz.value, syncCount, syncSeed, writeState, &r); err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
+	logCompleted()
+	cfg.Log.Info("sdbench phase started", "phase", "final_read_verify")
 	if err = phaseVerify(ctx, dataPath, sz.value, randomSeed, writeSeed, syncSeed, writeState, &r); err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
-	if err = os.Remove(dataPath); err != nil {
+	logCompleted()
+	if err = runCleanup(func() error { return os.Remove(dataPath) }); err != nil {
 		r.Error = err.Error()
 		return r, fmt.Errorf("remove data file: %w", err)
 	}
+	cfg.Log.Info("sdbench phase started", "phase", "metadata_create")
 	if err = phaseMetadata(ctx, workspace, fileCount, randomSeed, &r); err != nil {
 		r.Error = err.Error()
 		return r, err
 	}
+	logCompleted()
 	if after, e := inspectVolume(resolved); e == nil {
 		r.Target.AvailableAfter = after.AvailableBytes
 	}
 	r.Status = "passed"
+	cfg.Log.Info("sdbench completed", "target", resolved)
 	return r, nil
+}
+
+type cleanupTimeoutError struct{ timeout time.Duration }
+
+func (e cleanupTimeoutError) Error() string { return "cleanup timed out after " + e.timeout.String() }
+
+func runCleanup(fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	timer := time.NewTimer(cleanupTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return cleanupTimeoutError{cleanupTimeout}
+	}
+}
+
+func closeDataFile(r *report, f *os.File) error {
+	if err := runCleanup(f.Close); err != nil {
+		r.Warnings = append(r.Warnings, "could not close benchmark data file: "+err.Error())
+		return fmt.Errorf("close benchmark data file: %w", err)
+	}
+	return nil
+}
+
+func logCompletedPhases(r *report, phaseCount *int) {
+	for *phaseCount < len(r.Phases) {
+		p := r.Phases[*phaseCount]
+		cfg.Log.Info("sdbench phase completed", "phase", p.Name, "bytes", p.Bytes, "operations", p.Operations)
+		*phaseCount++
+	}
+}
+
+func logSequentialProgress(phase string, completed, total int64) {
+	percentage := float64(completed) * 100 / float64(total)
+	cfg.Log.Info("sdbench progress", "phase", phase, "completed_bytes", completed, "total_bytes", total, "percentage", percentage)
 }
 
 func patternFill(buf []byte, offset int64, seed int64) {
@@ -339,71 +399,95 @@ func checkContext(ctx context.Context) error {
 	}
 }
 
-func phaseSequential(ctx context.Context, path string, size, seed int64, r *report) error {
+func phaseSequential(ctx context.Context, path string, size, seed int64, r *report) (err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			closeErr := closeDataFile(r, f)
+			if err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+	}()
 	start := time.Now()
+	nextProgress := start.Add(sequentialProgressInterval)
 	buf := make([]byte, sequentialBlock)
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		if err = checkContext(ctx); err != nil {
-			f.Close()
 			return err
 		}
 		n := min64(int64(len(buf)), size-off)
 		patternFill(buf[:n], off, seed)
 		if _, err = f.Write(buf[:n]); err != nil {
-			f.Close()
 			return err
+		}
+		if time.Now().After(nextProgress) {
+			logSequentialProgress("sequential_write", off+n, size)
+			nextProgress = time.Now().Add(sequentialProgressInterval)
 		}
 	}
 	if err = f.Sync(); err != nil {
-		f.Close()
 		return err
 	}
 	elapsed := time.Since(start)
-	f.Close()
+	if err = closeDataFile(r, f); err != nil {
+		return err
+	}
+	closed = true
 	r.Phases = append(r.Phases, metric("sequential_write", size, 1, elapsed, latencyReport{}))
+	cfg.Log.Info("sdbench phase started", "phase", "sequential_read_verify")
 	f, err = os.Open(path)
 	if err != nil {
 		return err
 	}
+	closed = false
 	if err = prepareCache(f); err != nil {
-		f.Close()
 		return err
 	}
 	start = time.Now()
+	nextProgress = start.Add(sequentialProgressInterval)
 	verified := int64(0)
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		if err = checkContext(ctx); err != nil {
-			f.Close()
 			return err
 		}
 		n := min64(int64(len(buf)), size-off)
 		if _, err = io.ReadFull(f, buf[:n]); err != nil {
-			f.Close()
 			return err
 		}
 		if err = checkPattern(buf[:n], off, seed); err != nil {
-			f.Close()
 			return err
 		}
 		verified += n
+		if time.Now().After(nextProgress) {
+			logSequentialProgress("sequential_read_verify", verified, size)
+			nextProgress = time.Now().Add(sequentialProgressInterval)
+		}
 	}
-	f.Close()
+	if err = closeDataFile(r, f); err != nil {
+		return err
+	}
+	closed = true
 	p := metric("sequential_read_verify", size, 1, time.Since(start), latencyReport{})
 	p.VerifiedBytes = verified
 	r.Phases = append(r.Phases, p)
 	return nil
 }
 
-func phaseRandomRead(ctx context.Context, path string, size int64, duration time.Duration, seed int64, r *report) error {
+func phaseRandomRead(ctx context.Context, path string, size int64, duration time.Duration, seed int64, r *report) (err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := closeDataFile(r, f); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	if err = prepareCache(f); err != nil {
 		return err
 	}
@@ -416,15 +500,19 @@ const (
 	syncWriteBlock
 )
 
-func phaseRandomWrite(ctx context.Context, path string, size int64, duration time.Duration, seed int64, r *report) ([]byte, error) {
+func phaseRandomWrite(ctx context.Context, path string, size int64, duration time.Duration, seed int64, r *report) (state []byte, err error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := closeDataFile(r, f); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	// One byte per 4KiB block records which deterministic pattern owns the
 	// block. This bounds bookkeeping at 1MiB for the default 4GiB test.
-	state := make([]byte, size/randomBlock)
+	state = make([]byte, size/randomBlock)
 	err = randomPhaseWithExpected(ctx, f, size, duration, seed, state, randomWriteBlock, r, "random_write")
 	if err != nil {
 		return nil, err
@@ -476,12 +564,16 @@ func randomPhaseWithExpected(ctx context.Context, f *os.File, size int64, durati
 	return nil
 }
 
-func phaseSync(ctx context.Context, path string, size int64, count int, seed int64, state []byte, r *report) error {
+func phaseSync(ctx context.Context, path string, size int64, count int, seed int64, state []byte, r *report) (err error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := closeDataFile(r, f); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	buf := make([]byte, randomBlock)
 	samples := make([]int64, 0, count)
 	start := time.Now()
@@ -505,17 +597,22 @@ func phaseSync(ctx context.Context, path string, size int64, count int, seed int
 	return nil
 }
 
-func phaseVerify(ctx context.Context, path string, size, baseSeed, randomWriteSeed, syncSeed int64, state []byte, r *report) error {
+func phaseVerify(ctx context.Context, path string, size, baseSeed, randomWriteSeed, syncSeed int64, state []byte, r *report) (err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := closeDataFile(r, f); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	if err = prepareCache(f); err != nil {
 		return err
 	}
 	buf := make([]byte, sequentialBlock)
 	start := time.Now()
+	nextProgress := start.Add(sequentialProgressInterval)
 	var verified int64
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		if err = checkContext(ctx); err != nil {
@@ -539,6 +636,10 @@ func phaseVerify(ctx context.Context, path string, size, baseSeed, randomWriteSe
 			return err
 		}
 		verified += n
+		if time.Now().After(nextProgress) {
+			logSequentialProgress("final_read_verify", verified, size)
+			nextProgress = time.Now().Add(sequentialProgressInterval)
+		}
 	}
 	p := metric("final_read_verify", size, 1, time.Since(start), latencyReport{})
 	p.VerifiedBytes = verified
@@ -573,6 +674,7 @@ func phaseMetadata(ctx context.Context, dir string, count int, seed int64, r *re
 	}
 	createElapsed := time.Since(start)
 	r.Phases = append(r.Phases, metric("metadata_create", int64(count)*randomBlock, int64(count), createElapsed, latencyReport{}))
+	cfg.Log.Info("sdbench phase started", "phase", "metadata_read_verify")
 	start = time.Now()
 	for i := 0; i < count; i++ {
 		if err := checkContext(ctx); err != nil {
@@ -588,6 +690,7 @@ func phaseMetadata(ctx context.Context, dir string, count int, seed int64, r *re
 		}
 	}
 	r.Phases = append(r.Phases, metric("metadata_read_verify", int64(count)*randomBlock, int64(count), time.Since(start), latencyReport{}))
+	cfg.Log.Info("sdbench phase started", "phase", "metadata_delete")
 	start = time.Now()
 	for i := 0; i < count; i++ {
 		if err := os.Remove(filepath.Join(meta, fmt.Sprintf("%06d", i))); err != nil {
