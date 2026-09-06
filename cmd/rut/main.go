@@ -16,12 +16,14 @@ import (
 	"github.com/rusq/rut/cmd/rut/internal/cfg"
 	"github.com/rusq/rut/cmd/rut/internal/golang/base"
 	"github.com/rusq/rut/cmd/rut/internal/golang/help"
+	"github.com/rusq/rut/cmd/rut/internal/sdbench"
 )
 
 func init() {
 	base.CmdRUT.Commands = []*base.Command{
 		authloginfo.CmdAuthLogInfo,
 		bench.CmdBench,
+		sdbench.CmdSDBench,
 	}
 }
 
