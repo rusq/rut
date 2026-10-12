@@ -3,9 +3,11 @@ package toheic
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -42,7 +44,7 @@ func newFixture(t *testing.T) *fixture {
 			return []byte("public.heic heic Writable\n"), nil
 		}
 		if reflect.DeepEqual(args, []string{"-list", "format"}) {
-			return []byte("HEIC* HEIC rw+ High Efficiency Image Format\n"), nil
+			return []byte("HEIC* HEIC rw+ High Efficiency Image Format\nCRW DNG r-- RAW\nCR2 DNG r-- RAW\nNEF DNG r-- RAW\nNRW DNG r-- RAW\nJPEG* JPEG rw- JPEG\n"), nil
 		}
 		if args[0] == "identify" {
 			var b strings.Builder
@@ -84,6 +86,29 @@ func write(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("source bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRawWithoutDate(t *testing.T, path, format string) {
+	t.Helper()
+	if format == "crw" {
+		data := make([]byte, 40)
+		copy(data, "II\x1a\x00\x00\x00HEAPCCDR")
+		binary.LittleEndian.PutUint32(data[2:], 26)
+		// Root block starts at 26; its directory has zero records at offset 26.
+		binary.LittleEndian.PutUint32(data[len(data)-4:], 0)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	data := make([]byte, 14)
+	copy(data, "II")
+	binary.LittleEndian.PutUint16(data[2:], 42)
+	binary.LittleEndian.PutUint32(data[4:], 8)
+	// zero entries followed by the next-IFD offset
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -385,5 +410,216 @@ func TestTraversalErrorIsReported(t *testing.T) {
 	f := newFixture(t)
 	if err := f.b.run(context.Background(), filepath.Join(t.TempDir(), "missing")); err == nil || f.b.failed != 1 {
 		t.Fatalf("err=%v failed=%d", err, f.b.failed)
+	}
+}
+
+func TestRAWExtensions(t *testing.T) {
+	for _, ext := range []string{"crw", "cr2", "nef", "nrw"} {
+		for _, variant := range []string{ext, strings.ToUpper(ext)} {
+			if got := imageFormat("photo." + variant); got != ext || !isRAW(got) {
+				t.Fatalf("extension=%s format=%s", variant, got)
+			}
+		}
+	}
+}
+
+func TestRAWConversionArgumentsAndInput(t *testing.T) {
+	for _, format := range []string{"crw", "cr2", "nef", "nrw"} {
+		t.Run(format, func(t *testing.T) {
+			dir := t.TempDir()
+			source := filepath.Join(dir, "photo."+strings.ToUpper(format))
+			writeRawWithoutDate(t, source, format)
+			f := newFixture(t)
+			if err := f.b.run(context.Background(), dir); err != nil {
+				t.Fatal(err)
+			}
+			calls := strings.Join(f.calls, "\n")
+			want := "magick -define dng:use-camera-wb=true -define dng:read-thumbnails=false " + format + ":- -auto-orient -quality 85"
+			if !strings.Contains(calls, want) || strings.Contains(calls, "sips -s") {
+				t.Fatalf("calls=%s", calls)
+			}
+			data, err := os.ReadFile(source + ".heic")
+			sourceData, sourceErr := os.ReadFile(source)
+			if err != nil || sourceErr != nil || !bytes.Equal(data, append([]byte("encoded"), sourceData...)) {
+				t.Fatalf("input consumed: %q err=%v", data, err)
+			}
+			assertClean(t, dir)
+		})
+	}
+}
+
+func TestJPEGInRAWFile(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "photo.NEF")
+	data := []byte{0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3}
+	if err := os.WriteFile(source, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t)
+	if err := f.b.run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.diagnostics.String(), "RAW extension contains JPEG data") {
+		t.Fatal(f.diagnostics.String())
+	}
+	calls := strings.Join(f.calls, "\n")
+	if !strings.Contains(calls, "magick jpeg:- -auto-orient -quality 85") || strings.Contains(calls, "dng:") || strings.Contains(calls, "sips -s") {
+		t.Fatal(calls)
+	}
+	got, err := os.ReadFile(source + ".heic")
+	if err != nil || !bytes.Equal(got, append([]byte("encoded"), data...)) {
+		t.Fatalf("input consumed: %x err=%v", got, err)
+	}
+}
+
+func TestRAWFailuresContinue(t *testing.T) {
+	for _, mode := range []string{"sips", "noMagick", "noDecoder", "truncated", "decodeFailure"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			raw := filepath.Join(dir, "a.NEF")
+			write(t, raw)
+			write(t, filepath.Join(dir, "b.png"))
+			f := newFixture(t)
+			switch mode {
+			case "sips":
+				f.b.opts.encoder = "sips"
+			case "noMagick":
+				f.missing["magick"] = true
+			case "noDecoder":
+				original := f.b.exec
+				f.b.exec = func(ctx context.Context, name string, args []string, in io.Reader) ([]byte, error) {
+					data, err := original(ctx, name, args, in)
+					if args[0] == "-list" {
+						data = bytes.ReplaceAll(data, []byte("NEF DNG r--"), []byte("NEF DNG ---"))
+					}
+					return data, err
+				}
+			case "truncated":
+				if err := os.WriteFile(raw, []byte{0x49}, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "decodeFailure":
+				original := f.b.exec
+				f.b.exec = func(ctx context.Context, name string, args []string, in io.Reader) ([]byte, error) {
+					data, err := original(ctx, name, args, in)
+					if strings.Contains(strings.Join(args, " "), "nef:-") {
+						return nil, errors.New("unsupported camera")
+					}
+					return data, err
+				}
+			}
+			if err := f.b.run(context.Background(), dir); err == nil || f.b.failed != 1 || f.b.converted != 1 {
+				t.Fatalf("err=%v counts=%+v", err, f.b)
+			}
+			if _, err := os.Stat(raw + ".heic"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed output exists: %v", err)
+			}
+			assertClean(t, dir)
+		})
+	}
+}
+
+// Run explicitly with RUT_HEIC_SAMPLE_TESTS=1 when local camera samples are available.
+func TestCameraSamples(t *testing.T) {
+	if os.Getenv("RUT_HEIC_SAMPLE_TESTS") != "1" {
+		t.Skip("optional camera sample integration test")
+	}
+	sourceDir := filepath.Join("..", "..", "..", "..", "samples")
+	entries, err := os.ReadDir(sourceDir)
+	if os.IsNotExist(err) {
+		t.Skip("camera samples unavailable")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, diagnostics bytes.Buffer
+	b := batch{opts: options{85, true, "auto"}, out: &out, errOut: &diagnostics, exec: execute, lookup: exec.LookPath, link: os.Link}
+	b.probe(context.Background())
+	if b.magick == "" {
+		t.Skip("ImageMagick HEIC encoder unavailable")
+	}
+	dir := t.TempDir()
+	hashes := map[string][]byte{}
+	for _, entry := range entries {
+		if !isRAW(imageFormat(entry.Name())) {
+			continue
+		}
+		path := filepath.Join(sourceDir, entry.Name())
+		decoder, err := rawDecoder(path, imageFormat(entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !b.readable[decoder] {
+			t.Skipf("%s decoder unavailable for %s", decoder, entry.Name())
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes[entry.Name()] = append([]byte(nil), data...)
+		if err := os.WriteFile(filepath.Join(dir, entry.Name()), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(hashes) == 0 {
+		t.Skip("no camera samples")
+	}
+	if err := b.run(context.Background(), dir); err != nil {
+		t.Fatalf("%v\n%s", err, &diagnostics)
+	}
+	for name, hash := range hashes {
+		source := filepath.Join(dir, name)
+		format := imageFormat(name)
+		decoder, err := rawDecoder(source, format)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := execute(context.Background(), b.magick, []string{"identify", "-ping", "-format", "%w %h %[orientation]", decoder + ":" + source}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) != 3 {
+			t.Fatalf("source properties: %s", data)
+		}
+		w, h := fields[0], fields[1]
+		switch fields[2] {
+		case "LeftTop", "RightTop", "RightBottom", "LeftBottom":
+			w, h = h, w
+		}
+		data, err = execute(context.Background(), b.magick, []string{"identify", "-format", "%m %w %h %[orientation]", source + ".heic"}, nil)
+		if err != nil || strings.TrimSpace(string(data)) != "HEIC "+w+" "+h+" TopLeft" {
+			t.Fatalf("%s output=%s err=%v", name, data, err)
+		}
+		t.Logf("%s: %s", name, data)
+		for _, path := range []string{source, filepath.Join(sourceDir, name)} {
+			data, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(data, hash) {
+				t.Fatalf("source changed: %s", path)
+			}
+		}
+	}
+	converted := b.converted
+	if err := b.run(context.Background(), dir); err != nil || b.converted != converted || b.skipped != len(hashes) {
+		t.Fatalf("retry: %v counts=%+v", err, &b)
+	}
+	assertClean(t, dir)
+}
+
+func TestCameraSampleCaptureDates(t *testing.T) {
+	if os.Getenv("RUT_HEIC_SAMPLE_TESTS") != "1" {
+		t.Skip("optional camera sample metadata test")
+	}
+	for name, want := range map[string]captureDate{
+		"IMG_20080408_133524_Canon EOS 10D.CRW": {original: "2008:04:08 13:35:24"},
+		"IMG_20141231_183000_Canon EOS 5D.CR2":  {original: "2014:12:31 18:30:00"},
+		"IMG_20150210_185656_NIKON D80.NEF":     {original: "2015:02:10 18:56:56", subsec: "10"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := readCaptureDate(filepath.Join("..", "..", "..", "..", "samples", name), imageFormat(name))
+			if err != nil || !got.equal(want) {
+				t.Fatalf("got=%+v err=%v", got, err)
+			}
+		})
 	}
 }

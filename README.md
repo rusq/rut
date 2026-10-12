@@ -27,15 +27,15 @@ Convert images recursively while preserving originals:
     rut 2heic -quality 90 -recursive=false .
     rut 2heic -encoder magick /path/to/images
 
-The directory defaults to `.`. Supported extensions are PNG, JPG/JPEG, and
-TIF/TIFF, matched case-insensitively. Flags must precede the directory.
+The directory defaults to `.`. Supported extensions are PNG, JPG/JPEG,
+TIF/TIFF, Canon CRW/CR2, and Nikon NEF/NRW, matched case-insensitively. Flags must precede the directory.
 Quality defaults to 85 and accepts 0–100. Outputs are written beside sources
 as `photo.jpg.heic`; existing destinations are skipped, including symlinks.
 Directories and files reached through symlinks are not processed.
 
 Auto mode prefers macOS `sips` for PNG/JPEG and falls back per image to
-ImageMagick. TIFF always requires `magick` with HEIC write support; explicit
-`-encoder sips` reports TIFF files as failures. Encoders must be on PATH.
+ImageMagick. TIFF and RAW always require `magick` with HEIC write support;
+explicit `-encoder sips` reports TIFF and RAW files as failures. Encoders must be on PATH.
 Single-page TIFF uses `scan.tiff.heic`; multi-page TIFF produces
 `scan.tiff.page-0001.heic`, `scan.tiff.page-0002.heic`, etc. Successful pages
 are retained after a page failure, and retries skip completed outputs.
@@ -45,3 +45,17 @@ a filesystem with hard-link support. Failed conversions do not leave partial
 HEIC outputs. The command continues after individual failures, prints a
 converted/skipped/failed summary, and returns a nonzero status on failure.
 Metadata preservation and identical quality across encoders are not guaranteed.
+
+RAW conversion requires read support for the selected format in ImageMagick.
+It develops the full image using camera white balance and decoder defaults,
+then applies its orientation before HEIC encoding. Embedded thumbnails are
+not used. Rendering may differ from camera JPEGs. JPEG data inside a file with
+a RAW extension is decoded as JPEG with a warning; output names still retain
+the original extension, for example `photo.NEF.heic`.
+
+For genuine CRW, CR2, NEF, and NRW inputs, `2heic` preserves the EXIF capture
+date (`DateTimeOriginal`) and any available subseconds or offset, and verifies
+those fields before publishing the HEIC. A structurally valid RAW file with no
+capture date is converted with a warning; the command never invents one. This
+uses only the existing ImageMagick dependency—ExifTool and Perl are not
+required.

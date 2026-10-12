@@ -24,12 +24,19 @@ type options struct {
 
 var flags = options{85, true, "auto"}
 var CmdToHEIC = &base.Command{
-	Run: run, UsageLine: "rut 2heic [flags] [directory]", Short: "converts PNG, JPEG, and TIFF images to HEIC", FlagMask: cfg.OmitAll, PrintFlags: true,
-	Long: `2heic recursively converts PNG, JPEG, and TIFF images, preserving originals.
+	Run: run, UsageLine: "rut 2heic [flags] [directory]", Short: "converts images and Canon/Nikon RAW files to HEIC", FlagMask: cfg.OmitAll, PrintFlags: true,
+	Long: `2heic recursively converts PNG, JPEG, TIFF, Canon CRW/CR2, and Nikon NEF/NRW
+images, preserving originals.
 The directory defaults to the current directory. Flags must precede it.
 Outputs retain the source extension (photo.jpg.heic); existing outputs are skipped.
 Multi-page TIFF produces scan.tiff.page-0001.heic, scan.tiff.page-0002.heic, etc.
-TIFF always requires ImageMagick. Auto prefers sips for PNG/JPEG and falls back
+TIFF and RAW always require ImageMagick. RAW uses camera white balance and
+automatic orientation, decoding the full image rather than embedded thumbnails.
+JPEG data in a RAW-named file is detected and converted with a warning.
+For genuine RAW files, EXIF capture date, subseconds, and offset are retained
+and verified before publication. A RAW file without a capture date is converted
+with a warning; no date is invented. ExifTool and Perl are not required.
+Auto prefers sips for PNG/JPEG and falls back
 per image to ImageMagick. Encoder executables must be on PATH with HEIC support.
 Symlinks are not followed. Output publication requires filesystem hard-link support.
 Successful TIFF pages are retained if another page fails. Metadata preservation
@@ -45,7 +52,7 @@ Examples:
 func init() {
 	CmdToHEIC.Flag.IntVar(&flags.quality, "quality", 85, "encoder quality from 0 to 100")
 	CmdToHEIC.Flag.BoolVar(&flags.recursive, "recursive", true, "include subdirectories")
-	CmdToHEIC.Flag.StringVar(&flags.encoder, "encoder", "auto", "encoder: auto, sips, or magick (TIFF requires magick)")
+	CmdToHEIC.Flag.StringVar(&flags.encoder, "encoder", "auto", "encoder: auto, sips, or magick (TIFF and RAW require magick)")
 }
 func validate(o options, args []string) (string, error) {
 	if len(args) > 1 {
@@ -96,6 +103,7 @@ type batch struct {
 	link                       func(string, string) error
 	sips, magick               string
 	probed                     bool
+	readable                   map[string]bool
 	converted, skipped, failed int
 }
 
@@ -116,14 +124,38 @@ func imageFormat(path string) string {
 		return "jpeg"
 	case ".tif", ".tiff":
 		return "tiff"
+	case ".crw", ".cr2", ".nef", ".nrw":
+		return strings.ToLower(filepath.Ext(path)[1:])
 	}
 	return ""
 }
+func isRAW(format string) bool {
+	return format == "crw" || format == "cr2" || format == "nef" || format == "nrw"
+}
+
+func rawDecoder(path, format string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	var header [3]byte
+	_, err = io.ReadFull(f, header[:])
+	if err != nil {
+		return "", fmt.Errorf("read RAW signature: %w", err)
+	}
+	if header == [3]byte{0xff, 0xd8, 0xff} {
+		return "jpeg", nil
+	}
+	return format, nil
+}
+
 func (b *batch) probe(ctx context.Context) {
 	if b.probed {
 		return
 	}
 	b.probed = true
+	b.readable = make(map[string]bool)
 	if b.opts.encoder != "magick" {
 		if path, err := b.lookup("sips"); err == nil {
 			data, err := b.exec(ctx, path, []string{"--formats"}, nil)
@@ -143,8 +175,12 @@ func (b *batch) probe(ctx context.Context) {
 			if err == nil {
 				for _, line := range strings.Split(string(data), "\n") {
 					f := strings.Fields(line)
-					if len(f) >= 3 && strings.TrimSuffix(f[0], "*") == "HEIC" && strings.Contains(f[2], "w") {
-						b.magick = path
+					if len(f) >= 3 {
+						format := strings.ToLower(strings.TrimSuffix(f[0], "*"))
+						b.readable[format] = strings.Contains(f[2], "r")
+						if format == "heic" && strings.Contains(f[2], "w") {
+							b.magick = path
+						}
 					}
 				}
 			}
@@ -254,9 +290,42 @@ func (b *batch) convert(ctx context.Context, source, format string, page int, ou
 		b.failure(output, err)
 		return
 	}
+	rawInput := isRAW(format)
+	var capture captureDate
+	attachCapture := false
 	b.probe(ctx)
 	if ctx.Err() != nil {
 		return
+	}
+	if rawInput {
+		if b.magick == "" {
+			b.failure(source, errors.New("RAW requires ImageMagick with HEIC write support; use -encoder auto or magick"))
+			return
+		}
+		decoder, err := rawDecoder(source, format)
+		if err != nil {
+			b.failure(source, err)
+			return
+		}
+		if decoder != format {
+			fmt.Fprintf(b.errOut, "warning: %s: RAW extension contains JPEG data; decoding as JPEG\n", source)
+		} else {
+			capture, err = readCaptureDate(source, format)
+			if err != nil {
+				b.failure(source, fmt.Errorf("read RAW capture metadata: %w", err))
+				return
+			}
+			if capture.empty() {
+				fmt.Fprintf(b.errOut, "warning: %s: RAW source has no capture date; converting without one\n", source)
+			} else {
+				attachCapture = true
+			}
+		}
+		format = decoder
+		if !b.readable[format] {
+			b.failure(source, fmt.Errorf("ImageMagick lacks %s read support", strings.ToUpper(format)))
+			return
+		}
 	}
 	if b.sips == "" && b.magick == "" {
 		b.failure(source, errors.New("no HEIC encoder found: use macOS sips or install ImageMagick with HEIC support"))
@@ -274,14 +343,27 @@ func (b *batch) convert(ctx context.Context, source, format string, page int, ou
 		}
 	}()
 	staged := filepath.Join(temp, "output.heic")
+	profile := ""
+	if attachCapture {
+		data, err := exifProfile(capture)
+		if err != nil {
+			b.failure(source, err)
+			return
+		}
+		profile = filepath.Join(temp, "capture.exif")
+		if err := os.WriteFile(profile, data, 0600); err != nil {
+			b.failure(output, err)
+			return
+		}
+	}
 	var conversionErr error
-	if format != "tiff" && b.sips != "" {
+	if !rawInput && format != "tiff" && b.sips != "" {
 		_, conversionErr = b.exec(ctx, b.sips, []string{"-s", "format", "heic", "-s", "formatOptions", strconv.Itoa(b.opts.quality), source, "--out", staged}, nil)
 		if conversionErr == nil {
 			conversionErr = checkOutput(staged)
 		}
 	}
-	if (format == "tiff" || b.sips == "" || conversionErr != nil) && b.magick != "" && ctx.Err() == nil {
+	if (rawInput || format == "tiff" || b.sips == "" || conversionErr != nil) && b.magick != "" && ctx.Err() == nil {
 		if err := os.Remove(staged); err != nil && !errors.Is(err, os.ErrNotExist) {
 			b.failure(output, err)
 			return
@@ -292,7 +374,19 @@ func (b *batch) convert(ctx context.Context, source, format string, page int, ou
 			if page >= 0 {
 				input += fmt.Sprintf("[%d]", page)
 			}
-			_, err = b.exec(ctx, b.magick, []string{input, "-quality", strconv.Itoa(b.opts.quality), "heic:" + staged}, f)
+			var args []string
+			if isRAW(format) {
+				args = append(args, "-define", "dng:use-camera-wb=true", "-define", "dng:read-thumbnails=false")
+			}
+			args = append(args, input)
+			if rawInput {
+				args = append(args, "-auto-orient")
+			}
+			if profile != "" {
+				args = append(args, "-profile", "APP1:"+profile)
+			}
+			args = append(args, "-quality", strconv.Itoa(b.opts.quality), "heic:"+staged)
+			_, err = b.exec(ctx, b.magick, args, f)
 			f.Close()
 			if err == nil {
 				err = checkOutput(staged)
@@ -307,6 +401,22 @@ func (b *batch) convert(ctx context.Context, source, format string, page int, ou
 	if conversionErr != nil {
 		b.failure(output, conversionErr)
 		return
+	}
+	if attachCapture {
+		data, err := b.exec(ctx, b.magick, []string{"identify", "-ping", "-format", "%[EXIF:*]", staged}, nil)
+		if err != nil {
+			b.failure(output, fmt.Errorf("verify capture metadata: %w", err))
+			return
+		}
+		got, err := parseIdentifyDates(string(data))
+		if err != nil {
+			b.failure(output, fmt.Errorf("verify capture metadata: %w (%q)", err, string(data)))
+			return
+		}
+		if !capture.equal(got) {
+			b.failure(output, fmt.Errorf("capture metadata mismatch: source %s, output %s", capture, got))
+			return
+		}
 	}
 	if ctx.Err() != nil {
 		return
