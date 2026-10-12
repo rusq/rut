@@ -18,6 +18,7 @@ import (
 	"github.com/rusq/rut/cmd/rut/internal/golang/base"
 	"github.com/rusq/rut/cmd/rut/internal/golang/help"
 	"github.com/rusq/rut/cmd/rut/internal/sdbench"
+	"github.com/rusq/rut/cmd/rut/internal/toheic"
 )
 
 func init() {
@@ -25,6 +26,7 @@ func init() {
 		authloginfo.CmdAuthLogInfo,
 		bench.CmdBench,
 		sdbench.CmdSDBench,
+		toheic.CmdToHEIC,
 	}
 }
 
