@@ -43,9 +43,6 @@ func newFixture(t *testing.T) *fixture {
 		if reflect.DeepEqual(args, []string{"--formats"}) {
 			return []byte("public.heic heic Writable\n"), nil
 		}
-		if reflect.DeepEqual(args, []string{"-list", "format"}) {
-			return []byte("HEIC* HEIC rw+ High Efficiency Image Format\nCRW DNG r-- RAW\nCR2 DNG r-- RAW\nNEF DNG r-- RAW\nNRW DNG r-- RAW\nJPEG* JPEG rw- JPEG\n"), nil
-		}
 		if args[0] == "identify" {
 			var b strings.Builder
 			for i := 0; i < f.pages; i++ {
@@ -372,7 +369,7 @@ func TestExecuteDiagnosticsAndCancellation(t *testing.T) {
 }
 
 func TestCapabilityAndEnumerationFailures(t *testing.T) {
-	for _, mode := range []string{"readOnly", "probeError", "malformedPages", "identifyError"} {
+	for _, mode := range []string{"encoderError", "malformedPages", "identifyError"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			ext := "png"
@@ -384,11 +381,8 @@ func TestCapabilityAndEnumerationFailures(t *testing.T) {
 			f.b.opts.encoder = "magick"
 			original := f.b.exec
 			f.b.exec = func(ctx context.Context, name string, args []string, in io.Reader) ([]byte, error) {
-				if args[0] == "-list" && mode == "readOnly" {
-					return []byte("HEIC HEIC r-- read only"), nil
-				}
-				if args[0] == "-list" && mode == "probeError" {
-					return nil, errors.New("probe failed")
+				if mode == "encoderError" {
+					return nil, errors.New("HEIC encoder unavailable")
 				}
 				if args[0] == "identify" && mode == "malformedPages" {
 					return []byte("RUTPAGE:0\nRUTPAGE:2\n"), nil
@@ -545,13 +539,6 @@ func TestCameraSamples(t *testing.T) {
 			continue
 		}
 		path := filepath.Join(sourceDir, entry.Name())
-		decoder, err := rawDecoder(path, imageFormat(entry.Name()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !b.readable[decoder] {
-			t.Skipf("%s decoder unavailable for %s", decoder, entry.Name())
-		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -621,5 +608,55 @@ func TestCameraSampleCaptureDates(t *testing.T) {
 				t.Fatalf("got=%+v err=%v", got, err)
 			}
 		})
+	}
+}
+
+// A broken format listing must not prevent working encoders from converting.
+func TestConversionDoesNotListImageMagickFormats(t *testing.T) {
+	for _, encoder := range []string{"auto", "magick"} {
+		t.Run(encoder, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, filepath.Join(dir, "source.jpg"))
+			f := newFixture(t)
+			f.b.opts.encoder = encoder
+			f.sipsFail = true
+			original := f.b.exec
+			f.b.exec = func(ctx context.Context, name string, args []string, in io.Reader) ([]byte, error) {
+				if name == "magick" && args[0] == "-list" {
+					t.Fatal("format enumeration can hang while loading unrelated modules")
+				}
+				return original(ctx, name, args, in)
+			}
+			if err := f.b.run(context.Background(), dir); err != nil {
+				t.Fatal(err)
+			}
+			if f.b.converted != 1 {
+				t.Fatalf("converted=%d", f.b.converted)
+			}
+			assertClean(t, dir)
+		})
+	}
+}
+
+func TestSipsProbeTimeoutFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "source.jpg"))
+	f := newFixture(t)
+	original := f.b.exec
+	f.b.exec = func(ctx context.Context, name string, args []string, in io.Reader) ([]byte, error) {
+		if name == "sips" && args[0] == "--formats" {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("capability probe has no timeout")
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return original(ctx, name, args, in)
+	}
+	if err := f.b.run(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if f.b.converted != 1 || f.b.sips != "" {
+		t.Fatalf("converted=%d sips=%q", f.b.converted, f.b.sips)
 	}
 }

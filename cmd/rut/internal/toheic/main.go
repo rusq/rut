@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rusq/rut/cmd/rut/internal/cfg"
 	"github.com/rusq/rut/cmd/rut/internal/golang/base"
@@ -103,7 +104,6 @@ type batch struct {
 	link                       func(string, string) error
 	sips, magick               string
 	probed                     bool
-	readable                   map[string]bool
 	converted, skipped, failed int
 }
 
@@ -155,10 +155,11 @@ func (b *batch) probe(ctx context.Context) {
 		return
 	}
 	b.probed = true
-	b.readable = make(map[string]bool)
 	if b.opts.encoder != "magick" {
 		if path, err := b.lookup("sips"); err == nil {
-			data, err := b.exec(ctx, path, []string{"--formats"}, nil)
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			data, err := b.exec(probeCtx, path, []string{"--formats"}, nil)
+			cancel()
 			if err == nil {
 				for _, line := range strings.Split(string(data), "\n") {
 					f := strings.Fields(line)
@@ -171,19 +172,9 @@ func (b *batch) probe(ctx context.Context) {
 	}
 	if b.opts.encoder != "sips" {
 		if path, err := b.lookup("magick"); err == nil {
-			data, err := b.exec(ctx, path, []string{"-list", "format"}, nil)
-			if err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					f := strings.Fields(line)
-					if len(f) >= 3 {
-						format := strings.ToLower(strings.TrimSuffix(f[0], "*"))
-						b.readable[format] = strings.Contains(f[2], "r")
-						if format == "heic" && strings.Contains(f[2], "w") {
-							b.magick = path
-						}
-					}
-				}
-			}
+			// Listing every format loads unrelated coder modules and can hang even
+			// when HEIC conversion works. Let the conversion check codec support.
+			b.magick = path
 		}
 	}
 }
@@ -322,10 +313,6 @@ func (b *batch) convert(ctx context.Context, source, format string, page int, ou
 			}
 		}
 		format = decoder
-		if !b.readable[format] {
-			b.failure(source, fmt.Errorf("ImageMagick lacks %s read support", strings.ToUpper(format)))
-			return
-		}
 	}
 	if b.sips == "" && b.magick == "" {
 		b.failure(source, errors.New("no HEIC encoder found: use macOS sips or install ImageMagick with HEIC support"))
